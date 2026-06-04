@@ -181,4 +181,3 @@ contract DAOVote {
         }
     }
 }
-

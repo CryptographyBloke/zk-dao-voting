@@ -7,3 +7,28 @@ ptau/
 *.wasm
 *.json
 .env
+# Node.js
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# 环境秘钥 (绝对不能上传!)
+.env
+.env.local
+
+# Hardhat 编译产物
+artifacts/
+cache/
+typechain/
+typechain-types/
+coverage/
+coverage.json
+
+# ZK 电路庞大的密钥与编译产物
+circuits/keys/
+circuits/build/
+circuits/proofs/
+circuits/e2e/
+
+# Mac 系统文件
+.DS_Store
