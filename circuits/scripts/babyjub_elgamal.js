@@ -4,6 +4,7 @@
 //  运行： node babyjub_elgamal.js
 // ============================================================================
 const { buildBabyjub } = require("circomlibjs");
+const crypto = require("crypto");
 
 (async () => {
   const babyjub = await buildBabyjub();
@@ -15,11 +16,8 @@ const { buildBabyjub } = require("circomlibjs");
   const add = (P, Q) => babyjub.addPoint(P, Q);
   const eq  = (P, Q) => F.eq(P[0], Q[0]) && F.eq(P[1], Q[1]);
   const show = (P) => [F.toString(P[0]), F.toString(P[1])];
-  const rnd = () => {                       // 随机标量 ∈ [1, order)
-    let x = 0n;
-    for (let i = 0; i < 4; i++) x = (x << 64n) | BigInt(Math.floor(Math.random() * 2 ** 32));
-    return (x % (order - 1n)) + 1n;
-  };
+  // CSPRNG：密码学安全随机标量 ∈ [1, order)
+  const rnd = () => { let x; do { x = BigInt("0x" + crypto.randomBytes(32).toString("hex")) % order; } while (x === 0n); return x; };
 
   // ---- 1) 委员会公钥（Week 5 会换成 Shamir 分片；这里先单钥验证加密正确性）----
   const sk = rnd();

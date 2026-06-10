@@ -17,8 +17,10 @@ function load(name) {
 
 async function main() {
   const POLL_ID = 42, THRESHOLD = 3000;
-  // root = 投票公开信号里的 pub[9]
-  const root = JSON.parse(fs.readFileSync(`${DIR}/vote_0_public.json`))[9];
+  // root = 投票公开信号里的 pub[9]；委员会公钥 = pub[11..12]
+  const votePub0 = JSON.parse(fs.readFileSync(`${DIR}/vote_0_public.json`));
+  const root = votePub0[9];
+  const committeePK = [votePub0[11], votePub0[12]];   // Option C：合约强制每票用此 PK
 
   // 1) 部署三个 verifier + DAOVote
   const V = await (await hre.ethers.getContractFactory("VoteVerifier")).deploy();
@@ -26,7 +28,7 @@ async function main() {
   const T = await (await hre.ethers.getContractFactory("TallyVerifier")).deploy();
   await V.waitForDeployment(); await C.waitForDeployment(); await T.waitForDeployment();
   const DAO = await (await hre.ethers.getContractFactory("DAOVote")).deploy(
-    await V.getAddress(), await C.getAddress(), await T.getAddress(), root, POLL_ID, THRESHOLD);
+    await V.getAddress(), await C.getAddress(), await T.getAddress(), root, POLL_ID, THRESHOLD, committeePK);
   await DAO.waitForDeployment();
   console.log("DAOVote 部署于", await DAO.getAddress());
 

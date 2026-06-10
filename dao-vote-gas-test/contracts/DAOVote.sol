@@ -2,17 +2,20 @@
 pragma solidity ^0.8.19;
 
 // ============================================================================
-//  DAOVote (Week 6) —— 路 A：合约只做「验 Groth16 + 点加聚合 + 记录/比对」，
-//  不在链上做椭圆曲线标量乘（那些都在电路里）。
+//  DAOVote (Option C：winner-only) —— 路 A：合约只做「验 Groth16 + 点加聚合 + 记录/比对」。
 //
-//  你需要先用 snarkjs 生成三个 verifier 合约并改名（避免重名）：
-//    snarkjs zkey export solidityverifier full_final.zkey      VoteVerifier.sol
-//    snarkjs zkey export solidityverifier committee_final.zkey CommitteeVerifier.sol
-//    snarkjs zkey export solidityverifier tally_final.zkey     TallyVerifier.sol
+//  Option C 改动要点：
+//   1) 投票时强制密文公钥 == 委员会公钥 committeePK（防伪造 PK 破坏/篡改计票）。
+//   2) 委员部分解密只在链上记录承诺 cm_j = Poseidon(D_j)，不再公开 D_j；
+//      真正的 D_j 经链下安全通道交给聚合方，tally 证明在私密侧用 cm_j 绑定。
+//      → 链上观察者只看到 cm_j（隐藏）+ winner，无法重建聚合明文 total。
+//   3) 委员 id 去重，防重复提交导致 Lagrange 分母为 0。
+//
+//  生成三个 verifier 合约并改名（注意新的 public 信号数）：
+//    snarkjs zkey export solidityverifier full_final.zkey      VoteVerifier.sol      // uint[13]
+//    snarkjs zkey export solidityverifier committee_final.zkey CommitteeVerifier.sol // uint[7]
+//    snarkjs zkey export solidityverifier tally_final.zkey     TallyVerifier.sol     // uint[12]
 //  并把每个文件里的 `contract Groth16Verifier` 改成 VoteVerifier / CommitteeVerifier / TallyVerifier。
-//
-//  注意：snarkjs 生成的 verifyProof 公开信号顺序 = [电路 outputs..., 然后 public inputs...]。
-//  本合约按下面注释里的顺序拼数组；若你的电路改了信号顺序，按生成的 .sol 里 uint[N] 的 N 和顺序对齐。
 // ============================================================================
 
 // ---- BabyJubjub 仿射点加（公式已和 circomlibjs 逐位对齐验证）----
@@ -51,8 +54,8 @@ library BabyJub {
 }
 
 interface IVoteVerifier      { function verifyProof(uint[2] calldata a, uint[2][2] calldata b, uint[2] calldata c, uint[13] calldata pub) external view returns (bool); }
-interface ICommitteeVerifier { function verifyProof(uint[2] calldata a, uint[2][2] calldata b, uint[2] calldata c, uint[10] calldata pub) external view returns (bool); }
-interface ITallyVerifier     { function verifyProof(uint[2] calldata a, uint[2][2] calldata b, uint[2] calldata c, uint[21] calldata pub) external view returns (bool); }
+interface ICommitteeVerifier { function verifyProof(uint[2] calldata a, uint[2][2] calldata b, uint[2] calldata c, uint[7]  calldata pub) external view returns (bool); }
+interface ITallyVerifier     { function verifyProof(uint[2] calldata a, uint[2][2] calldata b, uint[2] calldata c, uint[12] calldata pub) external view returns (bool); }
 
 contract DAOVote {
     IVoteVerifier      public voteV;
@@ -63,6 +66,7 @@ contract DAOVote {
     uint256 public pollId;
     uint256 public threshold;       // 赢家阈值
     uint256 public constant T = 3;  // 门限（3-of-5）
+    uint256[2] public committeePK;  // 委员会聚合公钥（所有票必须用它加密）
 
     // 聚合密文（单位元初始化为 (0,1)）
     uint256[2] public C1Low  = [uint256(0), 1];
@@ -72,22 +76,27 @@ contract DAOVote {
 
     mapping(uint256 => bool) public nullifierUsed;
 
-    // 委员会成员注册：id => pk_j；以及收到的部分解密
+    // 委员会成员注册：id => pk_j；以及收到的部分解密【承诺】
     mapping(uint256 => uint256[2]) public committeePk;
     mapping(uint256 => bool)       public pkRegistered;
-    uint256[2][T] public DjLow;
-    uint256[2][T] public DjHigh;
+    mapping(uint256 => bool)       public decryptSubmitted;   // 防同一 id 重复提交
+    uint256[T]    public cm;          // Option C：只存承诺 cm_j = Poseidon(D_j)
     uint256[T]    public memberIds;
     uint256       public numDecrypts;
 
     bool    public finalized;
     uint256 public winner;
 
-    constructor(address _vote, address _comm, address _tally, uint256 _root, uint256 _pollId, uint256 _threshold) {
+    constructor(
+        address _vote, address _comm, address _tally,
+        uint256 _root, uint256 _pollId, uint256 _threshold,
+        uint256[2] memory _committeePK
+    ) {
         voteV = IVoteVerifier(_vote);
         commV = ICommitteeVerifier(_comm);
         tallyV = ITallyVerifier(_tally);
         merkleRoot = _root; pollId = _pollId; threshold = _threshold;
+        committeePK = _committeePK;
     }
 
     // 委员会成员注册公钥分片
@@ -96,12 +105,14 @@ contract DAOVote {
         committeePk[id] = pk; pkRegistered[id] = true;
     }
 
-    // ---- 1) 投票：验证明 + 查 nullifier + 链上聚合 ----
+    // ---- 1) 投票：验证明 + 查 nullifier + 校验 PK + 链上聚合 ----
     //  vote_full 公开信号顺序: [nullifier, C1Low(2), C2Low(2), C1High(2), C2High(2), root, pollId, PK(2)]
     function submitVote(uint[2] calldata a, uint[2][2] calldata b, uint[2] calldata c, uint[13] calldata pub) external {
         require(voteV.verifyProof(a, b, c, pub), "bad vote proof");
-        require(pub[9] == merkleRoot, "wrong root");      // pub[9]=root
+        require(pub[9]  == merkleRoot, "wrong root");      // pub[9]=root
         require(pub[10] == pollId,    "wrong poll");        // pub[10]=pollId
+        // 强制本票密文使用委员会聚合公钥，否则同态聚合后无法被门限正确解密（防篡改/破坏计票）
+        require(pub[11] == committeePK[0] && pub[12] == committeePK[1], "wrong PK");
         uint256 nf = pub[0];
         require(!nullifierUsed[nf], "double vote");
         nullifierUsed[nf] = true;
@@ -113,28 +124,29 @@ contract DAOVote {
         C2High = BabyJub.add(C2High, [pub[7], pub[8]]);
     }
 
-    // ---- 2) 委员会部分解密：验 circuit1 + 核对 pk_j 与聚合 C1 + 记录 D_j ----
-    //  committee 公开信号顺序: [pkj(2), DjLow(2), DjHigh(2), C1Low(2), C1High(2)]
-    function submitPartialDecrypt(uint256 id, uint[2] calldata a, uint[2][2] calldata b, uint[2] calldata c, uint[10] calldata pub) external {
+    // ---- 2) 委员会部分解密：验 circuit1 + 核对 pk_j 与聚合 C1 + 记录承诺 cm_j ----
+    //  committee 公开信号顺序: [pkj(2), cm(1), C1Low(2), C1High(2)]  (uint[7])
+    function submitPartialDecrypt(uint256 id, uint[2] calldata a, uint[2][2] calldata b, uint[2] calldata c, uint[7] calldata pub) external {
         require(pkRegistered[id], "not committee");
+        require(!decryptSubmitted[id], "id submitted");      // 去重：同一委员只能提交一次
         require(commV.verifyProof(a, b, c, pub), "bad committee proof");
         // 电路输出的 pk_j 必须等于注册的公钥（防止用别的钥匙）
         require(pub[0] == committeePk[id][0] && pub[1] == committeePk[id][1], "pk mismatch");
         // 电路用的 C1 必须等于链上聚合的 C1（防止解密别的密文）
-        require(pub[6] == C1Low[0]  && pub[7] == C1Low[1],  "C1Low mismatch");
-        require(pub[8] == C1High[0] && pub[9] == C1High[1], "C1High mismatch");
+        require(pub[3] == C1Low[0]  && pub[4] == C1Low[1],  "C1Low mismatch");
+        require(pub[5] == C1High[0] && pub[6] == C1High[1], "C1High mismatch");
 
         uint256 k = numDecrypts;
         require(k < T, "enough shares");
+        decryptSubmitted[id] = true;
         memberIds[k] = id;
-        DjLow[k]  = [pub[2], pub[3]];
-        DjHigh[k] = [pub[4], pub[5]];
+        cm[k] = pub[2];                                       // 只记录承诺，不记录 D_j
         numDecrypts = k + 1;
     }
 
     // ---- 3) finalize：合约算 λ_j，验 circuit2，读出赢家 ----
-    //  tally 公开信号顺序: [C2Low(2), C2High(2), DjLow(3*2), DjHigh(3*2), lambda(3), threshold, winner]
-    function finalize(uint[2] calldata a, uint[2][2] calldata b, uint[2] calldata c, uint[21] calldata pub) external {
+    //  tally 公开信号顺序: [C2Low(2), C2High(2), cm(3), lambda(3), threshold, winner]  (uint[12])
+    function finalize(uint[2] calldata a, uint[2][2] calldata b, uint[2] calldata c, uint[12] calldata pub) external {
         require(!finalized, "done");
         require(numDecrypts == T, "need T shares");
 
@@ -145,14 +157,13 @@ contract DAOVote {
         require(pub[0]==C2Low[0]  && pub[1]==C2Low[1],  "C2Low");
         require(pub[2]==C2High[0] && pub[3]==C2High[1], "C2High");
         for (uint256 j = 0; j < T; j++) {
-            require(pub[4 + 2*j]==DjLow[j][0]  && pub[5 + 2*j]==DjLow[j][1],  "DjLow");
-            require(pub[10 + 2*j]==DjHigh[j][0] && pub[11 + 2*j]==DjHigh[j][1], "DjHigh");
-            require(pub[16 + j]==lambda[j], "lambda");
+            require(pub[4 + j] == cm[j],     "cm");           // 承诺绑定到委员证明记录
+            require(pub[7 + j] == lambda[j], "lambda");
         }
-        require(pub[19]==threshold, "threshold");
+        require(pub[10]==threshold, "threshold");
         require(tallyV.verifyProof(a, b, c, pub), "bad tally proof");
 
-        winner = pub[20];
+        winner = pub[11];
         finalized = true;
     }
 
@@ -181,4 +192,3 @@ contract DAOVote {
         }
     }
 }
-

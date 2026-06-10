@@ -5,6 +5,7 @@
 //  运行： node babyjub_threshold.js
 // ============================================================================
 const { buildBabyjub } = require("circomlibjs");
+const crypto = require("crypto");
 
 (async () => {
   const babyjub = await buildBabyjub();
@@ -15,7 +16,7 @@ const { buildBabyjub } = require("circomlibjs");
   const add = (P, Q) => babyjub.addPoint(P, Q);
   const neg = (P) => [F.neg(P[0]), P[1]];
   const mod = (a, m) => ((a % m) + m) % m;
-  const rnd = () => { let x=0n; for(let i=0;i<4;i++) x=(x<<64n)|BigInt(Math.floor(Math.random()*2**32)); return (x%(q-1n))+1n; };
+  const rnd = () => { let x; do { x = BigInt("0x"+crypto.randomBytes(32).toString("hex"))%q; } while(x===0n); return x; };
   const inv = (a) => { let [r0,r1]=[mod(a,q),q],[s0,s1]=[1n,0n]; while(r1!==0n){const t=r0/r1;[r0,r1]=[r1,r0-t*r1];[s0,s1]=[s1,s0-t*s1];} return mod(s0,q); };
 
   // ---- 1) 委员会建钥：Shamir 把 sk 拆成 5 份，门限 3（任意 3 个能解，2 个不行）----

@@ -7,6 +7,7 @@
 // ============================================================================
 const { buildPoseidon, buildBabyjub } = require("circomlibjs");
 const fs = require("fs");
+const crypto = require("crypto");
 
 const DEPTH = 10, BASE = 1024n, POLL_ID = 42n, THRESHOLD = 3000n;
 const N = 4;                       // 演示 4 个投票者
@@ -21,7 +22,9 @@ const COMMITTEE_N = 5, T = 3;      // 3-of-5 委员会
   const neg = (P)=>[Fb.neg(P[0]),P[1]];
   const Spt = (P)=>[Fb.toString(P[0]),Fb.toString(P[1])];
   const mod=(a,m)=>((a%m)+m)%m;
-  const rnd=()=>{let x=0n;for(let i=0;i<4;i++)x=(x<<64n)|BigInt(Math.floor(Math.random()*2**32));return (x%(q-1n))+1n;};
+  // CSPRNG：密码学安全随机标量 ∈ [1, q)（修复原 Math.random 可预测 → 票面隐私漏洞）
+  const rnd=()=>{let x;do{x=BigInt("0x"+crypto.randomBytes(32).toString("hex"))%q;}while(x===0n);return x;};
+  const H4 = (P,Q)=>H([Fb.toObject(P[0]),Fb.toObject(P[1]),Fb.toObject(Q[0]),Fb.toObject(Q[1])]); // cm = Poseidon(DLow, DHigh)
   const inv=(a)=>{let[r0,r1]=[mod(a,q),q],[s0,s1]=[1n,0n];while(r1!==0n){const t=r0/r1;[r0,r1]=[r1,r0-t*r1];[s0,s1]=[s1,s0-t*s1];}return mod(s0,q);};
   const ID = [Fb.e(0n), Fb.e(1n)];     // 单位元（域元素形式）
 
@@ -69,8 +72,10 @@ const COMMITTEE_N = 5, T = 3;      // 3-of-5 委员会
   });
 
   // ---- 4) 选 3 个成员，对聚合 C1 做部分解密 + 生成 committee 输入 ----
+  //  Option C：委员证明只公开承诺 cm_j = Poseidon(D_jLow, D_jHigh)；真 D_j 链下交聚合方。
   const S=[members[0],members[2],members[4]];
   const Dlist=S.map(m=>({id:m.id, DL:mul(aggC1L,m.share), DH:mul(aggC1H,m.share)}));
+  Dlist.forEach(d=>{ d.cm = H4(d.DL, d.DH); });   // 期望承诺（电路应输出同值）
   S.forEach((m,k)=>{
     fs.writeFileSync(`e2e/committee_${m.id}.json`, JSON.stringify({
       skj:m.share.toString(), C1Low:Spt(aggC1L), C1High:Spt(aggC1H)
@@ -92,13 +97,18 @@ const COMMITTEE_N = 5, T = 3;      // 3-of-5 委员会
   const total=totalLow+BASE*totalHigh;
   const winner=total>THRESHOLD?1n:0n;
 
-  // ---- 6) tally 输入 ----
-  const flat=(arr)=>arr.reduce((o,p)=>o.concat(Spt(p)),[]);
+  // ---- 6) tally 输入（Option C：D_j 私密、只用承诺 cm 公开）----
+  //  public : C2Low, C2High, cm[t], lambda[t], threshold, winner
+  //  private: DjLow[t], DjHigh[t], totalLow, totalHigh
   fs.writeFileSync("e2e/tally.json", JSON.stringify({
+    // ---- public ----
     C2Low:Spt(aggC2L), C2High:Spt(aggC2H),
-    DjLow:Dlist.map(d=>Spt(d.DL)), DjHigh:Dlist.map(d=>Spt(d.DH)),
+    cm:Dlist.map(d=>d.cm.toString()),
     lambda:lambdas.map(x=>x.toString()), threshold:THRESHOLD.toString(),
-    winner:winner.toString(), totalLow:totalLow.toString(), totalHigh:totalHigh.toString()
+    winner:winner.toString(),
+    // ---- private（聚合方链下持有的真 D_j）----
+    DjLow:Dlist.map(d=>Spt(d.DL)), DjHigh:Dlist.map(d=>Spt(d.DH)),
+    totalLow:totalLow.toString(), totalHigh:totalHigh.toString()
   },null,2));
 
   // ---- 自检 ----
@@ -107,7 +117,14 @@ const COMMITTEE_N = 5, T = 3;      // 3-of-5 委员会
   console.log("还原 low/high =", totalLow.toString(), totalHigh.toString(),
               (totalLow===expLow&&totalHigh===expHigh)?"✅":"❌");
   console.log("total =", total.toString(), " threshold =", THRESHOLD.toString(), " winner =", winner.toString());
+
+  // ---- Option C 自检：链上观察者只有 cm（隐藏）拿不到 total；聚合方用 D_j 才能算 ----
+  const cmOk = Dlist.every(d => H4(d.DL, d.DH) === d.cm);
+  console.log("承诺一致性 cm_j == Poseidon(D_j):", cmOk ? "✅" : "❌");
+
   console.log("\n已写出 e2e/ 下：", N, "个 vote_*.json、3 个 committee_*.json、tally.json");
+  console.log("committeePK (构造函数入参) =", Spt(PK));
   console.log("聚合 C1Low =", Spt(aggC1L));
+  console.log("承诺 cm_j =", Dlist.map(d=>d.cm.toString()));
   console.log("委员会成员顺序 (memberIds):", S.map(m=>m.id).join(","), "← 链上按这个顺序提交");
 })();

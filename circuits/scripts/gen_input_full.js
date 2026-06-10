@@ -5,6 +5,7 @@
 // ============================================================================
 const { buildPoseidon, buildBabyjub } = require("circomlibjs");
 const fs = require("fs");
+const crypto = require("crypto");
 
 const DEPTH = 10, BASE = 1024n, POLL_ID = 42n;
 
@@ -17,7 +18,8 @@ const DEPTH = 10, BASE = 1024n, POLL_ID = 42n;
   const F = bj.F;
   const G = bj.Base8;
   const l = bj.subOrder;
-  const rndScalar = () => { let x = 0n; for (let i = 0; i < 4; i++) x = (x << 64n) | BigInt(Math.floor(Math.random() * 2 ** 32)); return x % l; };
+  // CSPRNG：密码学安全随机标量（修复原 Math.random 可预测 → ElGamal 随机数可爆破、票面隐私失效）
+  const rndScalar = () => { let x; do { x = BigInt("0x" + crypto.randomBytes(32).toString("hex")) % l; } while (x === 0n); return x; };
   const ptStr = (p) => [F.toString(p[0]), F.toString(p[1])];
 
   // ---- 选民 + 权重 ----
