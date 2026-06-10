@@ -6,6 +6,7 @@
 //  运行： node dkg.js
 // ============================================================================
 const { buildBabyjub } = require("circomlibjs");
+const crypto = require("crypto");
 (async () => {
   const babyjub = await buildBabyjub();
   const F = babyjub.F, G = babyjub.Base8, q = babyjub.subOrder;
@@ -13,7 +14,8 @@ const { buildBabyjub } = require("circomlibjs");
   const neg=(P)=>[F.neg(P[0]),P[1]], eqP=(P,Q)=>F.eq(P[0],Q[0])&&F.eq(P[1],Q[1]);
   const ID=[F.e(0n),F.e(1n)];
   const mod=(a,m)=>((a%m)+m)%m;
-  const rnd=()=>{let x=0n;for(let i=0;i<4;i++)x=(x<<64n)|BigInt(Math.floor(Math.random()*2**32));return (x%(q-1n))+1n;};
+  // CSPRNG：密码学安全随机标量 ∈ [1, q)（DKG 生成的是真实私钥份额，必须用 CSPRNG）
+  const rnd=()=>{let x;do{x=BigInt("0x"+crypto.randomBytes(32).toString("hex"))%q;}while(x===0n);return x;};
   const inv=(a)=>{let[r0,r1]=[mod(a,q),q],[s0,s1]=[1n,0n];while(r1!==0n){const t=r0/r1;[r0,r1]=[r1,r0-t*r1];[s0,s1]=[s1,s0-t*s1];}return mod(s0,q);};
 
   const n=5, t=3, ids=[1n,2n,3n,4n,5n];
