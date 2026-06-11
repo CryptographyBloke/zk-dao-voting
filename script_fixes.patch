@@ -1,0 +1,199 @@
+From 974a071139a4b90945268938106122f34c44fe0f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 10 Jun 2026 15:17:34 +0000
+Subject: [PATCH] fix(scripts): CSPRNG in dkg.js; rewrite broken full_verify.js
+ as child_process parallel verifier
+
+- dkg.js: replace Math.random() with crypto.randomBytes CSPRNG (DKG generates real
+  committee secret-key shares; predictable RNG would make threshold keys recoverable).
+- full_verify.js: previous version was non-functional (undefined 'replay', omitted
+  crypto helpers, and a literal '...)' syntax error). Rewritten as a child_process.fork
+  based parallel runner that embeds the verified replay_harness.js logic; each child is
+  a clean main-thread node process, avoiding the worker_threads/web-worker nesting that
+  produced spurious TypeErrors. Verified: clean output, correct winner-only match counts.
+---
+ circuits/scripts/dkg.js                  |   4 +-
+ dao-vote-gas-test/scripts/full_verify.js | 147 ++++++++++++++++++-----
+ 2 files changed, 119 insertions(+), 32 deletions(-)
+
+diff --git a/circuits/scripts/dkg.js b/circuits/scripts/dkg.js
+index cb6946e..f761b4d 100755
+--- a/circuits/scripts/dkg.js
++++ b/circuits/scripts/dkg.js
+@@ -6,6 +6,7 @@
+ //  运行： node dkg.js
+ // ============================================================================
+ const { buildBabyjub } = require("circomlibjs");
++const crypto = require("crypto");
+ (async () => {
+   const babyjub = await buildBabyjub();
+   const F = babyjub.F, G = babyjub.Base8, q = babyjub.subOrder;
+@@ -13,7 +14,8 @@ const { buildBabyjub } = require("circomlibjs");
+   const neg=(P)=>[F.neg(P[0]),P[1]], eqP=(P,Q)=>F.eq(P[0],Q[0])&&F.eq(P[1],Q[1]);
+   const ID=[F.e(0n),F.e(1n)];
+   const mod=(a,m)=>((a%m)+m)%m;
+-  const rnd=()=>{let x=0n;for(let i=0;i<4;i++)x=(x<<64n)|BigInt(Math.floor(Math.random()*2**32));return (x%(q-1n))+1n;};
++  // CSPRNG：密码学安全随机标量 ∈ [1, q)（DKG 生成的是真实私钥份额，必须用 CSPRNG）
++  const rnd=()=>{let x;do{x=BigInt("0x"+crypto.randomBytes(32).toString("hex"))%q;}while(x===0n);return x;};
+   const inv=(a)=>{let[r0,r1]=[mod(a,q),q],[s0,s1]=[1n,0n];while(r1!==0n){const t=r0/r1;[r0,r1]=[r1,r0-t*r1];[s0,s1]=[s1,s0-t*s1];}return mod(s0,q);};
+ 
+   const n=5, t=3, ids=[1n,2n,3n,4n,5n];
+diff --git a/dao-vote-gas-test/scripts/full_verify.js b/dao-vote-gas-test/scripts/full_verify.js
+index 585345c..d87d8d7 100644
+--- a/dao-vote-gas-test/scripts/full_verify.js
++++ b/dao-vote-gas-test/scripts/full_verify.js
+@@ -1,35 +1,120 @@
+-const { buildBabyjub } = require("circomlibjs");
++// ============================================================================
++//  真实 DAO 数据全量并行验证（child_process 版）
++//  与 scripts/replay_harness.js 同一套密码学逻辑，但把 18 个提案按区间切分，
++//  fork 出多个独立 node 子进程并行跑（每个子进程是干净的主线程，circomlibjs
++//  的内部线程池正常工作——这避免了 worker_threads 与 web-worker 的嵌套冲突）。
++//  结果汇总：全部提案中「winner-only 密文输出」与明文赢家一致的数量。
++//  运行： node scripts/full_verify.js   （读运行目录下的 proposals.json）
++// ============================================================================
+ const fs = require("fs");
+-const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
+-
+-// ... [此处省略相同的加密/解密函数，确保 workers 共享代码] ...
+-
+-if (isMainThread) {
+-    const PROPOSALS = JSON.parse(fs.readFileSync("proposals.json"));
+-    const numWorkers = 8;
+-    const chunkSize = Math.ceil(PROPOSALS.length / numWorkers);
+-    let completed = 0;
+-
+-    console.log(`🚀 启动全量并行验证：共 ${PROPOSALS.length} 个提案，分配到 ${numWorkers} 个核心...`);
+-
+-    for (let i = 0; i < numWorkers; i++) {
+-        const worker = new Worker(__filename, {
+-            workerData: { chunk: PROPOSALS.slice(i * chunkSize, (i + 1) * chunkSize), id: i }
+-        });
+-        worker.on('message', (msg) => {
+-            console.log(msg);
+-            completed++;
+-            if (completed === numWorkers) console.log("\n🏆 全量验证结束！");
+-        });
++const crypto = require("crypto");
++const { fork } = require("child_process");
++const { buildBabyjub } = require("circomlibjs");
++
++const WORKER = "--worker";
++
++// ---- 动态 (g,B,k) 参数提取（与 replay_harness 一致）----
++function gcdAll(a){const g=(x,y)=>y?g(y,x%y):x;return a.reduce((x,y)=>g(x,y));}
++function pickParams(weights,N,Lmax){
++  const g=gcdAll(weights.map(BigInt)); const scaled=weights.map(w=>BigInt(w)/g);
++  const W=scaled.reduce((m,x)=>x>m?x:m,0n);
++  let e=0n; while((1n<<(e+1n))-1n<=BigInt(Lmax)/BigInt(N)) e++; const B=1n<<e;
++  let k=1n,cap=B; while(cap<=W){cap*=B;k++;} return {g,B,k:Number(k),scaled};
++}
++
++// ---- 验证一段提案（区间 [start,end)），返回统计 ----
++async function verifyRange(proposals) {
++  const babyjub = await buildBabyjub();
++  const F = babyjub.F, G = babyjub.Base8, q = babyjub.subOrder;
++  const mul=(P,s)=>babyjub.mulPointEscalar(P,s), add=(P,Q)=>babyjub.addPoint(P,Q);
++  const neg=P=>[F.neg(P[0]),P[1]]; const ID=[F.e(0n),F.e(1n)];
++  const mod=(a,m)=>((a%m)+m)%m;
++  // CSPRNG：密码学安全随机标量 ∈ [1, q)
++  const rnd=()=>{let x;do{x=BigInt("0x"+crypto.randomBytes(32).toString("hex"))%q;}while(x===0n);return x;};
++  const inv=a=>{let[r0,r1]=[mod(a,q),q],[s0,s1]=[1n,0n];while(r1!==0n){const t=r0/r1;[r0,r1]=[r1,r0-t*r1];[s0,s1]=[s1,s0-t*s1];}return mod(s0,q);};
++  function bsgs(T,b){const m0=BigInt(Math.ceil(Math.sqrt(b))+1);const tb=new Map();let p=ID;for(let i=0n;i<m0;i++){tb.set(F.toString(p[0])+","+F.toString(p[1]),i);p=add(p,G);}const st=mul(G,m0),ns=neg(st);let c=T;for(let j=0n;j<=m0;j++){const kk=F.toString(c[0])+","+F.toString(c[1]);if(tb.has(kk))return j*m0+tb.get(kk);c=add(c,ns);}return null;}
++
++  // 3-of-5 门限委员会
++  const t=3,memIds=[1n,2n,3n,4n,5n]; const sk=rnd(),PK=mul(G,sk);
++  const co=[sk];for(let i=1;i<t;i++)co.push(rnd());
++  const f=x=>{let y=0n,xp=1n;for(const c of co){y=mod(y+c*xp,q);xp=mod(xp*x,q);}return y;};
++  const shares={};memIds.forEach(j=>shares[j]=f(j)); const S=[1n,3n,5n];
++  const lam=jj=>{let nu=1n,de=1n;for(const l of S)if(l!==jj){nu=mod(nu*l,q);de=mod(de*mod(l-jj,q),q);}return mod(nu*inv(de),q);};
++
++  function replay(ballots, threshold){
++    const weights=ballots.map(b=>b.weight); const N=ballots.length;
++    const {g,B,k,scaled}=pickParams(weights,Math.max(N,1),1<<20);
++    const aggC1=Array.from({length:k},()=>ID), aggC2=Array.from({length:k},()=>ID);
++    for(let idx=0; idx<N; idx++){
++      let w=scaled[idx]; const digits=[]; for(let d=0;d<k;d++){digits.push(w%B);w/=B;}
++      for(let d=0;d<k;d++){
++        const m=BigInt(ballots[idx].vote)*digits[d]; const r=rnd();
++        aggC1[d]=add(aggC1[d],mul(G,r));
++        aggC2[d]=add(aggC2[d],add(mul(G,m),mul(PK,r)));
++      }
+     }
+-} else {
+-    // Worker 线程执行逻辑
+-    const { chunk, id } = workerData;
+-    let matchCount = 0;
+-    for (let p of chunk) {
+-        // 这里执行你原本的 replay 逻辑
+-        const r = replay(p.weights.map((w,i)=>({weight:BigInt(w), vote:p.votes[i]})), ...);
+-        if(r.match) matchCount++;
++    let total=0n, Bk=1n;
++    for(let d=0;d<k;d++){
++      let comb=ID; for(const j of S) comb=add(comb,mul(mul(aggC1[d],shares[j]),lam(j)));
++      const M=add(aggC2[d],neg(comb)); const limb=bsgs(M,1<<20);
++      if(limb===null) return {ok:false};
++      total+=limb*Bk; Bk*=B;
++    }
++    const winner = (total*g)>BigInt(threshold)?1:0;
++    const gt=ballots.reduce((s,b)=>s+BigInt(b.weight)*BigInt(b.vote),0n);
++    return {ok:true, match: winner===(gt>BigInt(threshold)?1:0)};
++  }
++
++  let match=0, fail=0, mismatch=[], total=0;
++  for(const p of proposals){
++    const ballots = p.weights.map((w,i)=>({weight:BigInt(w), vote:p.votes[i]}));
++    if(ballots.length < 2) continue;
++    total++;
++    const thr = ballots.reduce((s,b)=>s+BigInt(b.weight),0n)/2n;   // 多数阈值 = 半数票权
++    const r = replay(ballots, thr);
++    if(!r.ok) { fail++; continue; }
++    if(r.match) match++; else mismatch.push(ballots.length);
++  }
++  return {match, fail, mismatch, total};
++}
++
++// ---- 子进程模式：fork 进来时执行这段（IPC 回传统计）----
++if (process.argv[2] === WORKER) {
++  const start = +process.argv[3], end = +process.argv[4];
++  const all = JSON.parse(fs.readFileSync("proposals.json"));
++  verifyRange(all.slice(start, end))
++    .then(res => { process.send(res); process.exit(0); })
++    .catch(e => { console.error(e); process.exit(1); });
++  return;
++}
++
++// ---- 主进程：切分区间，fork 子进程，汇总 ----
++const PROPOSALS = JSON.parse(fs.readFileSync("proposals.json"));
++const numWorkers = Math.max(1, Math.min(8, PROPOSALS.length));
++const chunkSize = Math.ceil(PROPOSALS.length / numWorkers);
++let done = 0, sumMatch = 0, sumFail = 0, sumTotal = 0, allMismatch = [];
++
++console.log(`🚀 启动全量并行验证：共 ${PROPOSALS.length} 个提案，分配到 ${numWorkers} 个进程...`);
++
++let launched = 0;
++for (let i = 0; i < numWorkers; i++) {
++  const start = i * chunkSize, end = Math.min(start + chunkSize, PROPOSALS.length);
++  if (start >= end) continue;
++  launched++;
++  const child = fork(__filename, [WORKER, String(start), String(end)]);
++  child.on("message", (m) => {
++    sumMatch += m.match; sumFail += m.fail; sumTotal += m.total; allMismatch.push(...m.mismatch);
++    console.log(`进程 #${i} 完成: ${m.match}/${m.total} 匹配${m.fail ? `（${m.fail} 个 BSGS 失败）` : ""}`);
++  });
++  child.on("exit", (code) => {
++    if (code !== 0) console.error(`进程 #${i} 异常退出 (code ${code})`);
++    if (++done === launched) {
++      console.log(`\n================= 全量并行验证战报 =================`);
++      console.log(`winner-only 密文输出与明文一致: ${sumMatch} / ${sumTotal}`);
++      if (sumFail) console.log(`⚠️ ${sumFail} 个提案因参数/BSGS 失败。`);
++      if (allMismatch.length) console.log(`⚠️ 不一致样例（N）:`, allMismatch.join(", "));
++      else if (!sumFail) console.log(`✅ 全部真实提案上 winner-only 输出都与明文赢家一致。`);
++      console.log(`===================================================`);
+     }
+-    parentPort.postMessage(`Core ${id} 完成任务: ${matchCount}/${chunk.length} 匹配`);
++  });
+ }
+-- 
+2.43.0
+

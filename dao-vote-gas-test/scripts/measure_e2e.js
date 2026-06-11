@@ -27,16 +27,14 @@ async function main() {
   const C = await (await hre.ethers.getContractFactory("CommitteeVerifier")).deploy();
   const T = await (await hre.ethers.getContractFactory("TallyVerifier")).deploy();
   await V.waitForDeployment(); await C.waitForDeployment(); await T.waitForDeployment();
+  // 委员会封闭集合：从各自 committee 证明公开输出 pub[0..1] 取 pk_j，部署时一次性固定（无开放注册）
+  const ids = [1, 3, 5];
+  const pks = ids.map(id => { const pub = JSON.parse(fs.readFileSync(`${DIR}/committee_${id}_public.json`)); return [pub[0], pub[1]]; });
+
   const DAO = await (await hre.ethers.getContractFactory("DAOVote")).deploy(
-    await V.getAddress(), await C.getAddress(), await T.getAddress(), root, POLL_ID, THRESHOLD, committeePK);
+    await V.getAddress(), await C.getAddress(), await T.getAddress(), root, POLL_ID, THRESHOLD, committeePK, ids, pks);
   await DAO.waitForDeployment();
   console.log("DAOVote 部署于", await DAO.getAddress());
-
-  // 2) 注册委员会成员 1,3,5（pk_j 取自各自 committee 证明的公开输出 pub[0..1]）
-  for (const id of [1, 3, 5]) {
-    const pub = JSON.parse(fs.readFileSync(`${DIR}/committee_${id}_public.json`));
-    await (await DAO.registerCommitteeMember(id, [pub[0], pub[1]])).wait();
-  }
 
   // 3) 先提交全部 4 张票（建立链上聚合）—— 必须在部分解密之前
   let voteGas;

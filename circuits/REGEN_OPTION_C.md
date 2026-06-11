@@ -60,15 +60,21 @@ cd ../dao-vote-gas-test && npx hardhat run scripts/measure_e2e.js
 
 ## 部署接口变化
 
-`DAOVote` 构造函数新增 `uint256[2] committeePK`（所有票必须用此公钥加密）：
+`DAOVote` 构造函数新增 `committeePK`（所有票必须用此公钥加密）+ **封闭委员会集合** `_ids/_pks`
+（部署时一次性固定 pk_j，已去掉开放的 `registerCommitteeMember`，防抢注/灌入无关 pk）：
 
 ```solidity
 constructor(address _vote, address _comm, address _tally,
             uint256 _root, uint256 _pollId, uint256 _threshold,
-            uint256[2] memory _committeePK)
+            uint256[2] memory _committeePK,
+            uint256[] memory _ids, uint256[2][] memory _pks)
 ```
 
-`measure_e2e.js` 已更新：从 `vote_0_public.json[11..12]` 读取 `committeePK` 传入。
+`measure_e2e.js` 已更新：`committeePK` 取自 `vote_0_public.json[11..12]`；`_ids=[1,3,5]`、
+`_pks` 取自各 `committee_{id}_public.json[0..1]`，部署时传入。
+
+> 注：委员会密钥现由 `node circuits/scripts/dkg.js` 体现的 **DKG（Feldman VSS）** 思路生成，
+> `orchestrate.js` 已接入多方建钥（无单一发牌人）；重生成证明时 committeePK / pk_j 会随之更新。
 
 ## 与论文的对应（只需改 ~2 句）
 

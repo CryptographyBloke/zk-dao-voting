@@ -28,11 +28,14 @@ const COMMITTEE_N = 5, T = 3;      // 3-of-5 委员会
   const inv=(a)=>{let[r0,r1]=[mod(a,q),q],[s0,s1]=[1n,0n];while(r1!==0n){const t=r0/r1;[r0,r1]=[r1,r0-t*r1];[s0,s1]=[s1,s0-t*s1];}return mod(s0,q);};
   const ID = [Fb.e(0n), Fb.e(1n)];     // 单位元（域元素形式）
 
-  // ---- 1) 委员会 Shamir 建钥 ----
-  const sk = rnd(), PK = mul(G, sk);
-  const coeffs=[sk]; for(let i=1;i<T;i++) coeffs.push(rnd());
-  const f=(x)=>{let y=0n,xp=1n;for(const c of coeffs){y=mod(y+c*xp,q);xp=mod(xp*x,q);}return y;};
-  const members=[]; for(let j=1;j<=COMMITTEE_N;j++){const s=f(BigInt(j));members.push({id:j,share:s,pk:mul(G,s)});}
+  // ---- 1) 委员会分布式密钥生成（DKG / Feldman VSS；无单一发牌人）----
+  //  每方 i 选一个 t-1 次多项式 f_i；sk = Σ_i f_i(0) 没有任何单方知道，PK = Σ_i f_i(0)·G。
+  //  成员 j 的合并份额 share_j = Σ_i f_i(j)，满足 share_j·G = pk_j，可直接做门限解密。
+  const parties=[]; for(let i=0;i<COMMITTEE_N;i++){const c=[];for(let k=0;k<T;k++)c.push(rnd());parties.push(c);}
+  const polyEval=(c,x)=>{let y=0n,xp=1n;for(const a of c){y=mod(y+a*xp,q);xp=mod(xp*x,q);}return y;};
+  let PK=ID; for(let i=0;i<COMMITTEE_N;i++) PK=add(PK, mul(G,parties[i][0]));   // PK = Σ a_{i,0}·G = sk·G（公开可算）
+  const members=[];
+  for(let j=1;j<=COMMITTEE_N;j++){let s=0n;for(let i=0;i<COMMITTEE_N;i++)s=mod(s+polyEval(parties[i],BigInt(j)),q);members.push({id:j,share:s,pk:mul(G,s)});}
 
   // ---- 2) 建注册树（深度10，前 N 个是真实选民，其余 0 叶子）----
   const voters=[];

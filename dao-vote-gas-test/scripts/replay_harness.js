@@ -7,6 +7,7 @@
 const { buildBabyjub } = require("circomlibjs");
 const fs = require("fs");
 const readline = require("readline");
+const crypto = require("crypto");
 
 function gcdAll(a){const g=(x,y)=>y?g(y,x%y):x;return a.reduce((x,y)=>g(x,y));}
 function pickParams(weights,N,Lmax){
@@ -22,7 +23,7 @@ function pickParams(weights,N,Lmax){
   const mul=(P,s)=>babyjub.mulPointEscalar(P,s),add=(P,Q)=>babyjub.addPoint(P,Q);
   const neg=P=>[F.neg(P[0]),P[1]]; const ID=[F.e(0n),F.e(1n)];
   const mod=(a,m)=>((a%m)+m)%m;
-  const rnd=()=>{let x=0n;for(let i=0;i<4;i++)x=(x<<64n)|BigInt(Math.floor(Math.random()*2**32));return (x%(q-1n))+1n;};
+  const rnd=()=>{let x;do{x=BigInt("0x"+crypto.randomBytes(32).toString("hex"))%q;}while(x===0n);return x;};
   const inv=a=>{let[r0,r1]=[mod(a,q),q],[s0,s1]=[1n,0n];while(r1!==0n){const t=r0/r1;[r0,r1]=[r1,r0-t*r1];[s0,s1]=[s1,s0-t*s1];}return mod(s0,q);};
   function bsgs(T,b){const m0=BigInt(Math.ceil(Math.sqrt(b))+1);const tb=new Map();let p=ID;for(let i=0n;i<m0;i++){tb.set(F.toString(p[0])+","+F.toString(p[1]),i);p=add(p,G);}const st=mul(G,m0),ns=neg(st);let c=T;for(let j=0n;j<=m0;j++){const kk=F.toString(c[0])+","+F.toString(c[1]);if(tb.has(kk))return j*m0+tb.get(kk);c=add(c,ns);}return null;}
 

@@ -90,19 +90,21 @@ contract DAOVote {
     constructor(
         address _vote, address _comm, address _tally,
         uint256 _root, uint256 _pollId, uint256 _threshold,
-        uint256[2] memory _committeePK
+        uint256[2] memory _committeePK,
+        uint256[] memory _ids, uint256[2][] memory _pks
     ) {
         voteV = IVoteVerifier(_vote);
         commV = ICommitteeVerifier(_comm);
         tallyV = ITallyVerifier(_tally);
         merkleRoot = _root; pollId = _pollId; threshold = _threshold;
         committeePK = _committeePK;
-    }
-
-    // 委员会成员注册公钥分片
-    function registerCommitteeMember(uint256 id, uint256[2] calldata pk) external {
-        require(!pkRegistered[id], "id used");
-        committeePk[id] = pk; pkRegistered[id] = true;
+        // 封闭委员会集合：部署时一次性固定 {id => pk_j}，不开放注册（防抢注/灌入无关 pk）。
+        require(_ids.length == _pks.length, "len");
+        for (uint256 i = 0; i < _ids.length; i++) {
+            require(!pkRegistered[_ids[i]], "dup id");
+            committeePk[_ids[i]] = _pks[i];
+            pkRegistered[_ids[i]] = true;
+        }
     }
 
     // ---- 1) 投票：验证明 + 查 nullifier + 校验 PK + 链上聚合 ----
