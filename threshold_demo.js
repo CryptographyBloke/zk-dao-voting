@@ -5,6 +5,7 @@
 // ===========================================================================
 const { bn254 } = require("@noble/curves/bn254");
 const { keccak_256 } = require("@noble/hashes/sha3");
+const crypto = require("crypto");
 
 const P = bn254.G1.ProjectivePoint;   // G1 上的点（用投影坐标表示）
 const G = P.BASE;                       // 生成元 G
@@ -13,7 +14,7 @@ const q = bn254.G1.CURVE.n;             // 群的阶（标量必须 mod q
 // ---- 小工具 ----
 const rnd = () => {                     // 随机标量 ∈ [1, q)
   let x = 0n;
-  for (let i = 0; i < 4; i++) x = (x << 64n) | BigInt(Math.floor(Math.random() * 2 ** 32));
+  x = BigInt("0x" + crypto.randomBytes(32).toString("hex"));
   return (x % (q - 1n)) + 1n;
 };
 const mod = (a, m) => ((a % m) + m) % m;
